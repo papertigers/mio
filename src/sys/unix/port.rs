@@ -27,7 +27,7 @@ type PortEvUser = *mut ::libc::c_void;
 /// event port "object" field in `port_associate` aka the fd
 type PortEvObject = ::libc::uintptr_t;
 /// event port "nget" and "max" fields in `port_getn`
-type Count = ::libc::uint32_t;
+type Count = ::libc::c_uint;
 
 /// Generates a `port_associate` call with all the proper casting.
 macro_rules! port_associate {
@@ -37,7 +37,9 @@ macro_rules! port_associate {
             libc::PORT_SOURCE_FD, // always operating in this mode
             $object as PortEvObject,
             $events as c_int,
-            usize::from($user) as PortEvUser,
+            //usize::from($user) as PortEvUser,
+            //&mut $user as *mut _ as PortEvUser,
+            usize::from($user) as *mut usize as PortEvUser,
         )
     };
 }
@@ -87,6 +89,7 @@ impl Selector {
             tv_sec: cmp::min(to.as_secs(), time_t::max_value() as u64) as time_t,
             tv_nsec: to.subsec_nanos() as libc::c_long,
         });
+
         let timeout = timeout
             .as_ref()
             .map(|s| s as *const _)
@@ -94,20 +97,29 @@ impl Selector {
 
         evts.clear();
         unsafe {
-            let nget: u32 = 1;
+            let mut nget: u32 = 1;
             let ret = libc::port_getn(
                 self.port,
                 evts.sys_events.0.as_mut_ptr(),
                 evts.sys_events.0.capacity() as Count,
-                nget as *mut Count,
+                &mut nget as *mut ::libc::c_uint,
                 timeout as *mut ::libc::timespec,
             );
 
             match ret {
                 -1 => {
-                    // TODO handle ETIME... MANTA-3112
-                    let os_error = Err(io::Error::last_os_error());
-                    os_error
+                    let os_error = io::Error::last_os_error();
+                    match os_error.kind() {
+                        // ETIME is valid return value for event ports, so we have to check for
+                        // events that need to be processed
+                        io::ErrorKind::TimedOut => {
+                            if nget as usize > 0 {
+                                return Ok(evts.coalesce(awakener));
+                            }
+                            Err(os_error)
+                        }
+                        _ => Err(os_error),
+                    }
                 }
                 _ => {
                     // port_getn should only ever return 0 or -1
@@ -148,7 +160,9 @@ impl Selector {
         }
 
         // TODO figure out what to do about edge triggered since event ports doesn't support it
+        // maybe port_alert(3C)?
 
+        //let mut token = token.clone();
         unsafe {
             cvt(port_associate!(self.port, fd, flags, token))?;
         }
@@ -285,6 +299,9 @@ impl Events {
             if e.portev_events as i16 & libc::POLLHUP != 0 {
                 event::kind_mut(&mut self.events[idx]).insert(UnixReady::hup());
             }
+
+            // Handle reassociate if needed
+            // Will probably need to move things around so we have access to the Selector
         }
 
         ret
