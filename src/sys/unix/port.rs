@@ -101,11 +101,11 @@ impl Selector {
             .map(|s| s as *const _)
             .unwrap_or(ptr::null_mut());
 
-        // Handle reassociate if needed
+        // Handle level-triggered reassociate if needed
         if self.has_fd_to_reassociate.load(Ordering::Acquire) {
             let fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
             for (fd, ti) in fd_to_reassociate_lock.iter() {
-                if ti.needs_rearm {
+                if ti.needs_rearm  && !ti.edge_triggered {
                     // XXX handle possible error
                     unsafe { port_associate!(self.port, *fd, ti.flags, usize::from(ti.token)) };
                 }
@@ -122,6 +122,17 @@ impl Selector {
                 &mut nget as *mut ::libc::c_uint,
                 timeout as *mut ::libc::timespec,
             );
+
+            // Handle edge-triggered reassociate if needed
+            if self.has_fd_to_reassociate.load(Ordering::Acquire) {
+                let fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
+                for (fd, ti) in fd_to_reassociate_lock.iter() {
+                    if ti.needs_rearm  && ti.edge_triggered {
+                        // XXX handle possible error
+                        port_associate!(self.port, *fd, ti.flags, usize::from(ti.token));
+                    }
+                }
+            }
 
             match ret {
                 -1 => {
@@ -199,21 +210,33 @@ impl Selector {
 
     /// Deregister event interests for the given IO handle with the OS
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        unsafe {
-            cvt(libc::port_dissociate(
-                self.port,
-                libc::PORT_SOURCE_FD,
-                fd as ::libc::uintptr_t,
-            ))?;
-        }
+        let mut cleanup: bool = true;
 
-        // If we know there are fds that are not registered with oneshot we need to safely remove
-        // the de-registering fd from fd_to_reassociate if we were tracking it
+        // We need to check for any fd's that might be set to rearm but haven't yet
         if self.has_fd_to_reassociate.load(Ordering::Acquire) {
             let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
+            match fd_to_reassociate_lock.get(&fd) {
+                Some(info) => {
+                    if info.needs_rearm {
+                        cleanup = false
+                    }
+                }
+                None => cleanup = true,
+            }
+
             let _ = fd_to_reassociate_lock.remove(&fd);
             let has_fds = fd_to_reassociate_lock.len() > 0;
             self.has_fd_to_reassociate.store(has_fds, Ordering::Release);
+        }
+
+        if cleanup {
+            unsafe {
+                cvt(libc::port_dissociate(
+                    self.port,
+                    libc::PORT_SOURCE_FD,
+                    fd as ::libc::uintptr_t,
+                ))?;
+            }
         }
         Ok(())
     }
@@ -314,17 +337,7 @@ impl Events {
             if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
                 let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
                 if let Some(ti) = fd_to_reassociate_lock.get_mut(&fd) {
-                    if ti.edge_triggered {
-                        ti.needs_rearm = true;
-                    } else {
-                        unsafe {
-                            match cvt(port_associate!(selector.port, fd, ti.flags,
-                                usize::from(token))) {
-                                Ok(_) => (),
-                                Err(_) => ret = false,
-                            }
-                        }
-                    }
+                    ti.needs_rearm = true;
                 }
             }
         }
