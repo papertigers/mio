@@ -99,7 +99,7 @@ impl Selector {
 
         evts.clear();
         unsafe {
-            let mut nget: u32 = 0;
+            let mut nget = evts.capacity() as u32;
             let ret = libc::port_getn(
                 self.port,
                 evts.sys_events.0.as_mut_ptr(),
@@ -111,14 +111,12 @@ impl Selector {
             match ret {
                 -1 => {
                     let os_error = io::Error::last_os_error();
-                    match os_error.kind() {
+                    match os_error.raw_os_error().unwrap() {
                         // ETIME is valid return value for event ports, so we have to check for
                         // events that need to be processed
-                        io::ErrorKind::TimedOut => {
-                            if nget as usize > 0 {
-                                return Ok(evts.coalesce(awakener, &self));
-                            }
-                            Err(os_error)
+                        libc::ETIME | libc::EAGAIN | libc::EINTR  => {
+                            evts.sys_events.0.set_len(nget as usize);
+                            Ok(evts.coalesce(awakener, &self))
                         }
                         _ => Err(os_error),
                     }
@@ -127,8 +125,7 @@ impl Selector {
                     // port_getn should only ever return 0 or -1
                     debug_assert_eq!(ret, 0);
 
-                    let nget = nget as usize;
-                    evts.sys_events.0.set_len(nget);
+                    evts.sys_events.0.set_len(nget as usize);
                     Ok(evts.coalesce(awakener, &self))
                 }
             }
@@ -303,10 +300,10 @@ impl Events {
             }
 
             // Handle reassociate if needed
+            // XXX flags needs to actually be implemented
             if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
                 let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
                 if let Some(fd) = fd_to_reassociate_lock.get(&awakener) {
-                    //let flags = (e.portev_object as PortEvObject) as usize;
                     unsafe {
                         match cvt(port_associate!(selector.port, *fd, POLLIN | POLLOUT, token)) {
                             Ok(_) => (),
@@ -317,6 +314,7 @@ impl Events {
             }
         }
 
+        println!("MIKE coalesce returning {} events", self.events.len());
         ret
     }
 
@@ -325,6 +323,8 @@ impl Events {
     }
 
     pub fn clear(&mut self) {
+        self.sys_events.0.truncate(0);
         self.events.truncate(0);
+        self.event_map.clear();
     }
 }
