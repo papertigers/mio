@@ -37,11 +37,7 @@ macro_rules! port_associate {
             libc::PORT_SOURCE_FD, // always operating in this mode
             $object as PortEvObject,
             $events as c_int,
-            //usize::from($user) as PortEvUser,
-            //&mut $user as *mut _ as PortEvUser,
-            //$user as *mut usize as PortEvUser,
-            //usize::from($user) as *mut usize as PortEvUser,
-            &mut $user as *mut _ as PortEvUser,
+            $user as PortEvUser,
         )
     };
 }
@@ -141,7 +137,6 @@ impl Selector {
         opts: PollOpt,
     ) -> io::Result<()> {
         let mut flags = 0;
-        let mut token = token.clone();
 
         if interests.is_readable() {
             flags |= POLLIN;
@@ -160,7 +155,7 @@ impl Selector {
         // TODO figure out what to do about edge triggered since event ports doesn't support it
         // maybe port_alert(3C)?
         unsafe {
-            cvt(port_associate!(self.port, fd, flags, token))?;
+            cvt(port_associate!(self.port, fd, flags, usize::from(token)))?;
         }
 
         Ok(())
@@ -267,8 +262,7 @@ impl Events {
         self.event_map.clear();
 
         for e in self.sys_events.0.iter() {
-            //let token = Token(e.portev_user as usize);
-            let mut token = unsafe { *(e.portev_user as *mut Token) };
+            let token = Token(e.portev_user as usize);
             let len = self.events.len();
 
             if token == awakener {
@@ -305,7 +299,8 @@ impl Events {
                 let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
                 if let Some(fd) = fd_to_reassociate_lock.get(&awakener) {
                     unsafe {
-                        match cvt(port_associate!(selector.port, *fd, POLLIN | POLLOUT, token)) {
+                        match cvt(port_associate!(selector.port, *fd, POLLIN | POLLOUT,
+                            usize::from(token))) {
                             Ok(_) => (),
                             Err(_) => ret = false,
                         }
@@ -314,7 +309,6 @@ impl Events {
             }
         }
 
-        println!("MIKE coalesce returning {} events", self.events.len());
         ret
     }
 
