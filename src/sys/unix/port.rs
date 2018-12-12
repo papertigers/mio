@@ -120,7 +120,6 @@ impl Selector {
                             }
                             Err(os_error)
                         }
-                        io::ErrorKind::TimedOut => {
                         _ => Err(os_error),
                     }
                 }
