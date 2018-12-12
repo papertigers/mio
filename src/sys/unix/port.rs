@@ -43,6 +43,13 @@ macro_rules! port_associate {
 }
 
 #[derive(Debug)]
+struct TokenInfo {
+    token: Token,
+    flags: c_int,
+    level_triggered: bool,
+}
+
+#[derive(Debug)]
 pub struct Selector {
     id: usize,
     port: RawFd,
@@ -52,7 +59,7 @@ pub struct Selector {
     /// Keeps a list of RawFds that need to be reassociated with `port_associate` after a call to
     /// `port_getn`, since event ports are always oneshot and intended to be used in a
     /// multithreaded environment.
-    fd_to_reassociate: Mutex<HashMap<Token, RawFd>>,
+    fd_to_reassociate: Mutex<HashMap<RawFd, TokenInfo>>,
 }
 
 impl Selector {
@@ -92,6 +99,17 @@ impl Selector {
             .as_ref()
             .map(|s| s as *const _)
             .unwrap_or(ptr::null_mut());
+
+        // Handle reassociate if needed
+        if self.has_fd_to_reassociate.load(Ordering::Acquire) {
+            let fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
+            for (fd, ti) in fd_to_reassociate_lock.iter() {
+                if ti.level_triggered {
+                    // XXX handle possible error
+                    unsafe { port_associate!(self.port, *fd, ti.flags, usize::from(ti.token)) };
+                }
+            }
+        }
 
         evts.clear();
         unsafe {
@@ -137,6 +155,7 @@ impl Selector {
         opts: PollOpt,
     ) -> io::Result<()> {
         let mut flags = 0;
+        let level_triggered = opts.is_level();
 
         if interests.is_readable() {
             flags |= POLLIN;
@@ -148,7 +167,13 @@ impl Selector {
 
         if !opts.is_oneshot() {
             let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-            fd_to_reassociate_lock.entry(token).or_insert(fd);
+            fd_to_reassociate_lock.entry(fd).or_insert(
+                TokenInfo {
+                    token,
+                    flags: flags as i32,
+                    level_triggered,
+                }
+            );
             self.has_fd_to_reassociate.store(true, Ordering::Release);
         }
 
@@ -186,16 +211,7 @@ impl Selector {
         // the de-registering fd from fd_to_reassociate if we were tracking it
         if self.has_fd_to_reassociate.load(Ordering::Acquire) {
             let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-
-            //There has to be a more efficient way, this is a hack just to make forward progress
-            let mut remove: Vec<Token> = Vec::with_capacity(fd_to_reassociate_lock.len());
-            let _ = fd_to_reassociate_lock.iter()
-                .map(|(k, v)| if *v == fd {remove.push(*k)});
-
-            for key in remove.iter() {
-                fd_to_reassociate_lock.remove(key);
-            }
-
+            let _ = fd_to_reassociate_lock.remove(&fd);
             let has_fds = fd_to_reassociate_lock.len() > 0;
             self.has_fd_to_reassociate.store(has_fds, Ordering::Release);
         }
@@ -263,6 +279,7 @@ impl Events {
 
         for e in self.sys_events.0.iter() {
             let token = Token(e.portev_user as usize);
+            let fd: RawFd = e.portev_object as RawFd;
             let len = self.events.len();
 
             if token == awakener {
@@ -294,15 +311,16 @@ impl Events {
             }
 
             // Handle reassociate if needed
-            // XXX flags needs to actually be implemented
             if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
                 let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
-                if let Some(fd) = fd_to_reassociate_lock.get(&awakener) {
-                    unsafe {
-                        match cvt(port_associate!(selector.port, *fd, POLLIN | POLLOUT,
-                            usize::from(token))) {
-                            Ok(_) => (),
-                            Err(_) => ret = false,
+                if let Some(ti) = fd_to_reassociate_lock.get(&fd) {
+                    if !ti.level_triggered {
+                        unsafe {
+                            match cvt(port_associate!(selector.port, fd, ti.flags,
+                                usize::from(token))) {
+                                Ok(_) => (),
+                                Err(_) => ret = false,
+                            }
                         }
                     }
                 }
