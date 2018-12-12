@@ -46,7 +46,8 @@ macro_rules! port_associate {
 struct TokenInfo {
     token: Token,
     flags: c_int,
-    level_triggered: bool,
+    edge_triggered: bool,
+    needs_rearm: bool,
 }
 
 #[derive(Debug)]
@@ -104,7 +105,7 @@ impl Selector {
         if self.has_fd_to_reassociate.load(Ordering::Acquire) {
             let fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
             for (fd, ti) in fd_to_reassociate_lock.iter() {
-                if ti.level_triggered {
+                if ti.needs_rearm {
                     // XXX handle possible error
                     unsafe { port_associate!(self.port, *fd, ti.flags, usize::from(ti.token)) };
                 }
@@ -113,7 +114,7 @@ impl Selector {
 
         evts.clear();
         unsafe {
-            let mut nget = evts.capacity() as u32;
+            let mut nget: u32 = 1;
             let ret = libc::port_getn(
                 self.port,
                 evts.sys_events.0.as_mut_ptr(),
@@ -155,7 +156,7 @@ impl Selector {
         opts: PollOpt,
     ) -> io::Result<()> {
         let mut flags = 0;
-        let level_triggered = opts.is_level();
+        let edge_triggered = opts.is_edge();
 
         if interests.is_readable() {
             flags |= POLLIN;
@@ -171,14 +172,13 @@ impl Selector {
                 TokenInfo {
                     token,
                     flags: flags as i32,
-                    level_triggered,
+                    edge_triggered,
+                    needs_rearm: false,
                 }
             );
             self.has_fd_to_reassociate.store(true, Ordering::Release);
         }
 
-        // TODO figure out what to do about edge triggered since event ports doesn't support it
-        // maybe port_alert(3C)?
         unsafe {
             cvt(port_associate!(self.port, fd, flags, usize::from(token)))?;
         }
@@ -313,8 +313,10 @@ impl Events {
             // Handle reassociate if needed
             if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
                 let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
-                if let Some(ti) = fd_to_reassociate_lock.get(&fd) {
-                    if !ti.level_triggered {
+                if let Some(ti) = fd_to_reassociate_lock.get_mut(&fd) {
+                    if ti.edge_triggered {
+                        ti.needs_rearm = true;
+                    } else {
                         unsafe {
                             match cvt(port_associate!(selector.port, fd, ti.flags,
                                 usize::from(token))) {
