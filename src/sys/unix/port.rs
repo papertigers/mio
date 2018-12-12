@@ -39,7 +39,9 @@ macro_rules! port_associate {
             $events as c_int,
             //usize::from($user) as PortEvUser,
             //&mut $user as *mut _ as PortEvUser,
-            usize::from($user) as *mut usize as PortEvUser,
+            //$user as *mut usize as PortEvUser,
+            //usize::from($user) as *mut usize as PortEvUser,
+            &mut $user as *mut _ as PortEvUser,
         )
     };
 }
@@ -54,7 +56,7 @@ pub struct Selector {
     /// Keeps a list of RawFds that need to be reassociated with `port_associate` after a call to
     /// `port_getn`, since event ports are always oneshot and intended to be used in a
     /// multithreaded environment.
-    fd_to_reassociate: Mutex<Vec<RawFd>>,
+    fd_to_reassociate: Mutex<HashMap<Token, RawFd>>,
 }
 
 impl Selector {
@@ -63,7 +65,7 @@ impl Selector {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) + 1;
         let port = unsafe { cvt(libc::port_create())? };
         let has_fd_to_reassociate = AtomicBool::new(false);
-        let fd_to_reassociate = Mutex::new(Vec::new());
+        let fd_to_reassociate = Mutex::new(HashMap::new());
         drop(set_cloexec(port));
 
         Ok(Selector {
@@ -97,7 +99,7 @@ impl Selector {
 
         evts.clear();
         unsafe {
-            let mut nget: u32 = 1;
+            let mut nget: u32 = 0;
             let ret = libc::port_getn(
                 self.port,
                 evts.sys_events.0.as_mut_ptr(),
@@ -114,10 +116,11 @@ impl Selector {
                         // events that need to be processed
                         io::ErrorKind::TimedOut => {
                             if nget as usize > 0 {
-                                return Ok(evts.coalesce(awakener));
+                                return Ok(evts.coalesce(awakener, &self));
                             }
                             Err(os_error)
                         }
+                        io::ErrorKind::TimedOut => {
                         _ => Err(os_error),
                     }
                 }
@@ -127,7 +130,7 @@ impl Selector {
 
                     let nget = nget as usize;
                     evts.sys_events.0.set_len(nget);
-                    Ok(evts.coalesce(awakener))
+                    Ok(evts.coalesce(awakener, &self))
                 }
             }
         }
@@ -142,6 +145,7 @@ impl Selector {
         opts: PollOpt,
     ) -> io::Result<()> {
         let mut flags = 0;
+        let mut token = token.clone();
 
         if interests.is_readable() {
             flags |= POLLIN;
@@ -153,16 +157,12 @@ impl Selector {
 
         if !opts.is_oneshot() {
             let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-            if !fd_to_reassociate_lock.contains(&fd) {
-                fd_to_reassociate_lock.push(fd);
-                self.has_fd_to_reassociate.store(true, Ordering::Release);
-            }
+            fd_to_reassociate_lock.entry(token).or_insert(fd);
+            self.has_fd_to_reassociate.store(true, Ordering::Release);
         }
 
         // TODO figure out what to do about edge triggered since event ports doesn't support it
         // maybe port_alert(3C)?
-
-        //let mut token = token.clone();
         unsafe {
             cvt(port_associate!(self.port, fd, flags, token))?;
         }
@@ -196,12 +196,14 @@ impl Selector {
         if self.has_fd_to_reassociate.load(Ordering::Acquire) {
             let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
 
-            // Evaluate how expensive this is when watching a lot of fds
-            // There is no order to the Vec so we use swap_remove to be more efficient
-            fd_to_reassociate_lock
-                .iter()
-                .position(|&i| i == fd)
-                .map(|idx| fd_to_reassociate_lock.swap_remove(idx));
+            //There has to be a more efficient way, this is a hack just to make forward progress
+            let mut remove: Vec<Token> = Vec::with_capacity(fd_to_reassociate_lock.len());
+            let _ = fd_to_reassociate_lock.iter()
+                .map(|(k, v)| if *v == fd {remove.push(*k)});
+
+            for key in remove.iter() {
+                fd_to_reassociate_lock.remove(key);
+            }
 
             let has_fds = fd_to_reassociate_lock.len() > 0;
             self.has_fd_to_reassociate.store(has_fds, Ordering::Release);
@@ -263,13 +265,14 @@ impl Events {
         self.events.get(idx).map(|e| *e)
     }
 
-    fn coalesce(&mut self, awakener: Token) -> bool {
+    fn coalesce(&mut self, awakener: Token, selector: &Selector) -> bool {
         let mut ret = false;
         self.events.clear();
         self.event_map.clear();
 
         for e in self.sys_events.0.iter() {
-            let token = Token(e.portev_user as usize);
+            //let token = Token(e.portev_user as usize);
+            let mut token = unsafe { *(e.portev_user as *mut Token) };
             let len = self.events.len();
 
             if token == awakener {
@@ -301,7 +304,18 @@ impl Events {
             }
 
             // Handle reassociate if needed
-            // Will probably need to move things around so we have access to the Selector
+            if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
+                let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
+                if let Some(fd) = fd_to_reassociate_lock.get(&awakener) {
+                    //let flags = (e.portev_object as PortEvObject) as usize;
+                    unsafe {
+                        match cvt(port_associate!(selector.port, *fd, POLLIN | POLLOUT, token)) {
+                            Ok(_) => (),
+                            Err(_) => ret = false,
+                        }
+                    }
+                }
+            }
         }
 
         ret
