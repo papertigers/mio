@@ -28,7 +28,7 @@ impl EchoConn {
     }
 
     fn writable(&mut self, poll: &mut Poll) -> io::Result<()> {
-        let mut buf = self.buf.take().unwrap();
+        let mut buf = self.buf.take().expect("buf.take() failed");
 
         match self.sock.try_write_buf(&mut buf) {
             Ok(None) => {

@@ -84,6 +84,11 @@ impl Selector {
         self.id
     }
 
+    /*
+     * MIKE:
+     * event ports is always operating in level triggered mode?
+     */
+
     /// Wait for events from the OS
     pub fn select(
         &self,
@@ -91,6 +96,9 @@ impl Selector {
         awakener: Token,
         timeout: Option<Duration>,
     ) -> io::Result<bool> {
+        //println!("MIKE - select starting");
+        evts.clear();
+
         let timeout = timeout.map(|to| libc::timespec {
             tv_sec: cmp::min(to.as_secs(), time_t::max_value() as u64) as time_t,
             tv_nsec: to.subsec_nanos() as libc::c_long,
@@ -103,16 +111,17 @@ impl Selector {
 
         // Handle level-triggered reassociate if needed
         if self.has_fd_to_reassociate.load(Ordering::Acquire) {
-            let fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-            for (fd, ti) in fd_to_reassociate_lock.iter() {
+            let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
+            for (fd, ti) in fd_to_reassociate_lock.iter_mut() {
+                //println!("MIKE - fd in reassociate: {} {:?}", fd, ti);
                 if ti.needs_rearm  && !ti.edge_triggered {
+                    ti.needs_rearm = false;
                     // XXX handle possible error
                     unsafe { port_associate!(self.port, *fd, ti.flags, usize::from(ti.token)) };
                 }
             }
         }
 
-        evts.clear();
         unsafe {
             let mut nget: u32 = 1;
             let ret = libc::port_getn(
@@ -124,15 +133,16 @@ impl Selector {
             );
 
             // Handle edge-triggered reassociate if needed
-            if self.has_fd_to_reassociate.load(Ordering::Acquire) {
-                let fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-                for (fd, ti) in fd_to_reassociate_lock.iter() {
-                    if ti.needs_rearm  && ti.edge_triggered {
-                        // XXX handle possible error
-                        port_associate!(self.port, *fd, ti.flags, usize::from(ti.token));
-                    }
-                }
-            }
+            //if self.has_fd_to_reassociate.load(Ordering::Acquire) {
+            //    let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
+            //    for (fd, ti) in fd_to_reassociate_lock.iter_mut() {
+            //        if ti.needs_rearm  && ti.edge_triggered {
+            //            ti.needs_rearm = false;
+            //            // XXX handle possible error
+            //            port_associate!(self.port, *fd, ti.flags, usize::from(ti.token));
+            //        }
+            //    }
+            //}
 
             match ret {
                 -1 => {
@@ -192,6 +202,7 @@ impl Selector {
 
         unsafe {
             cvt(port_associate!(self.port, fd, flags, usize::from(token)))?;
+            //println!("MIKE registering -- fd: {}  flags: {} token: {:?} edge: {} oneshot: {}", &fd, &flags, &token, opts.is_edge(), opts.is_oneshot());
         }
 
         Ok(())
@@ -305,7 +316,20 @@ impl Events {
             let fd: RawFd = e.portev_object as RawFd;
             let len = self.events.len();
 
+            //println!("MIKE - Event for fd: {}", fd);
+
             if token == awakener {
+                // rearm the awakener?
+                if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
+                    let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
+                    if let Some(ti) = fd_to_reassociate_lock.get_mut(&fd) {
+                        if !ti.edge_triggered {
+                            ti.needs_rearm = true;
+                        } else {
+                            unsafe { port_associate!(selector.port, fd, ti.flags, usize::from(ti.token)) };
+                        }
+                    }
+                }
                 ret = true;
                 continue;
             }
@@ -337,11 +361,18 @@ impl Events {
             if selector.has_fd_to_reassociate.load(Ordering::Acquire) {
                 let mut fd_to_reassociate_lock = selector.fd_to_reassociate.lock().unwrap();
                 if let Some(ti) = fd_to_reassociate_lock.get_mut(&fd) {
-                    ti.needs_rearm = true;
+                    if !ti.edge_triggered {
+                        ti.needs_rearm = true;
+                    } else {
+                        //println!("MIKE - reassociated: {}", fd);
+                        unsafe { port_associate!(selector.port, fd, ti.flags, usize::from(ti.token)) };
+                    }
                 }
             }
+            //println!("MIKE - coalesce final even: {:?}", self.events[idx]);
         }
 
+        //println!("MIKE - coalesce returning: {}", self.len());
         ret
     }
 

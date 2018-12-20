@@ -24,6 +24,7 @@ impl TestHandler {
     }
 
     fn handle_read(&mut self, poll: &mut Poll, token: Token) {
+        println!("MIKE - handle_read called");
         match token {
             SERVER => {
                 trace!("handle_read; token=SERVER");
@@ -53,7 +54,7 @@ impl TestHandler {
 }
 
 #[test]
-pub fn test_register_deregister() {
+pub fn mike() {
     let _ = ::env_logger::init();
 
     debug!("Starting TEST_REGISTER_DEREGISTER");
@@ -77,6 +78,9 @@ pub fn test_register_deregister() {
     loop {
         poll.poll(&mut events, None).unwrap();
 
+        for e in events.iter() {
+            println!("MIKE - loop's event: {:?}", e);
+        }
         if let Some(event) = events.get(0) {
             if event.readiness().is_readable() {
                 handler.handle_read(&mut poll, event.token());
